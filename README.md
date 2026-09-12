@@ -1,62 +1,87 @@
 # Online Retail Lakehouse Pipeline
 
-An end-to-end batch data engineering project that transforms retail transaction data through Bronze, Silver, and Gold lakehouse layers using Databricks, PySpark, Delta Lake, Unity Catalog, and Pandas.
+An incremental batch data engineering pipeline built with Databricks, PySpark, Delta Lake, Unity Catalog, Lakeflow Jobs, and Pandas. The project processes monthly retail transactions through Bronze, Silver, and Gold layers with idempotent Delta `MERGE` operations, cross-layer reconciliation, run auditing, failure handling, and operational monitoring.
 
 ## Project overview
 
-The source is the **Online Retail II** Excel workbook containing two worksheets and **1,067,371 records**. Pandas is used locally to preserve source lineage, divide the workbook into monthly CSV batches, and validate batch completeness.
+The source is the [Online Retail II dataset on Kaggle](https://www.kaggle.com/datasets/mashlyn/online-retail-ii-uci), supplied as an Excel workbook with two worksheets and **1,067,371 transaction records**.
 
-**Dataset:** [Online Retail II – Kaggle](https://www.kaggle.com/datasets/lakshmi25npathi/online-retail-dataset?resource=download)
+The pipeline has two stages:
 
-One monthly batch (`2009-12`) is then processed in Databricks as a working pipeline implementation:
+1. **Local source preparation:** Pandas preserves workbook lineage, combines the worksheets, derives monthly batch IDs, exports 25 monthly CSV files, and reconciles the exported row count with the source workbook.
+2. **Databricks lakehouse processing:** A parameterized Lakeflow Job processes a selected monthly batch through Bronze, Silver, Gold, and validation tasks. A separate failure-handler task records unsuccessful task states.
 
-1. **Bronze:** Ingest the CSV using an explicit schema and preserve source metadata.
-2. **Silver:** Remove duplicate records, standardize fields, and add data-quality and business-rule flags.
-3. **Gold:** Aggregate positive sales by month and product for analytical use.
-4. **Validation:** Reconcile Silver and Gold totals using PySpark.
+Three monthly batches were processed to demonstrate the completed pipeline:
+
+| Batch | Purpose |
+|---|---|
+| `2009-12` | Initial table creation and baseline processing |
+| `2010-01` | Incremental load and Delta `MERGE` testing |
+| `2010-02` | Orchestrated processing and end-to-end idempotency testing |
 
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[Online Retail II Excel] --> B[Pandas source preparation]
     B --> C[Monthly CSV batches]
     C --> D[Unity Catalog volume]
+
     D --> E[Bronze Delta table]
     E --> F[Silver Delta table]
-    F --> G[Gold Delta table]
-    F --> H[PySpark validation]
-    G --> H
+    F --> G[Gold product summary]
+    G --> H[Analytics consumers]
+
+    J["Lakeflow Job: Bronze → Silver → Gold → Validation"] -. orchestrates .-> E
+
+    E --> V[Pipeline validation]
+    F --> V
+    G --> V
+
+    E --> K[Control table]
+    F --> K
+    G --> K
+    V --> K
+
+    J -. on task failure .-> X[Failure handler]
+    X --> K
 ```
+
+![Lakeflow Job dependency graph](docs/images/lakeflow-job-dag.png)
 
 ## Technology stack
 
 | Technology | Usage |
 |---|---|
-| Python and Pandas | Read both Excel sheets, add source metadata, create monthly batches, and validate exported files |
-| Databricks | Development and execution environment |
-| PySpark | Distributed ingestion, transformation, aggregation, and validation |
-| Delta Lake | Reliable managed-table storage for Bronze, Silver, and Gold data |
+| Python and Pandas | Read the Excel workbook, preserve source lineage, generate monthly batches, and reconcile exported rows |
+| Databricks | Lakehouse development and execution environment |
+| PySpark | Distributed ingestion, transformation, aggregation, profiling, and reconciliation |
+| Delta Lake | Managed tables, ACID transactions, and idempotent `MERGE` operations |
 | Unity Catalog | Catalog, schema, table, and volume organization |
-| Databricks SQL | Environment setup and table inspection |
-| GitHub | Version control and project documentation |
+| Lakeflow Jobs | Parameterized orchestration, task dependencies, and failure routing |
+| Databricks SQL | Environment setup and operational monitoring queries |
+| GitHub | Project repository, documentation, and execution evidence |
 
 ## Data flow and implementation
 
 ### Source preparation
 
-- Reads both workbook sheets with Pandas.
-- Records `source_sheet` and the original Excel `source_row_number` before combining the sheets.
+The Pandas preparation notebook:
+
+- Reads both workbook worksheets.
+- Adds `source_sheet` and the original Excel `source_row_number` before combining the data.
 - Derives `batch_id` from `InvoiceDate` in `YYYY-MM` format.
-- Generates **25 monthly CSV files**.
-- Reconciles the generated files against all **1,067,371 source rows**.
+- Exports **25 monthly CSV batches**.
+- Reconciles the exported files with all **1,067,371 source rows**.
+
+The source workbook and generated CSV files are excluded from this repository.
 
 ### Bronze layer
 
-**Source**
+**Parameterized source**
 
 ```text
-/Volumes/online_retail/bronze/source_files/online_retail_2009-12.csv
+/Volumes/online_retail/bronze/source_files/online_retail_{batch_id}.csv
 ```
 
 **Target**
@@ -67,14 +92,14 @@ online_retail.bronze.transactions_raw
 
 The Bronze process:
 
-- Reads the CSV with its header and an explicit PySpark schema.
+- Validates the `batch_id` parameter in exact `YYYY-MM` format.
+- Reads one monthly CSV using an explicit PySpark schema.
 - Renames source columns to consistent `snake_case` names.
-- Preserves source lineage columns from the preparation stage.
-- Adds the source filename, source file path, and ingestion timestamp.
-- Writes the result as a managed Delta table.
-- Reconciles the source DataFrame and stored table row counts.
-
-**Bronze records stored:** `45,228`
+- Preserves workbook lineage and adds Databricks file metadata.
+- Adds an ingestion timestamp.
+- Generates a stable SHA-256 `record_id` from `source_sheet` and `source_row_number`.
+- Validates row counts, key uniqueness, null keys, and batch assignment.
+- Uses an insert-only Delta `MERGE` so reruns do not duplicate records or overwrite the initially ingested Bronze version.
 
 ### Silver layer
 
@@ -92,29 +117,17 @@ online_retail.silver.transactions_clean
 
 The Silver process:
 
-- Removes duplicates using the original business columns.
-- Trims whitespace from relevant string columns.
-- Removes the `.0` suffix introduced in populated customer identifiers.
-- Retains records with missing customer IDs or descriptions instead of deleting them.
-- Adds the following business and quality flags:
-  - `is_cancelled`
-  - `has_customer_id`
-  - `has_description`
-  - `is_positive_sale`
+- Profiles missing values, negative quantities, zero prices, and cancelled invoices.
+- Removes duplicate business records using a deterministic `row_number()` window.
+- Trims relevant text fields.
+- Removes the trailing `.0` introduced in populated customer identifiers.
+- Retains missing customer IDs, missing descriptions, and negative quantities for downstream analysis rather than deleting potentially genuine records.
+- Adds `is_cancelled`, `has_customer_id`, `has_description`, and `is_positive_sale` flags.
 - Calculates `line_total` as `quantity * price`.
-- Writes the cleaned result as a managed Delta table.
+- Upserts records with Delta `MERGE` using `record_id`.
+- Validates stored counts, duplicate keys, missing prepared records, and obsolete records.
 
-| Silver quality result | Record count |
-|---|---:|
-| Bronze input records | 45,228 |
-| Duplicate records removed | 506 |
-| Silver records stored | 44,722 |
-| Cancelled records | 1,013 |
-| Positive-sale records | 43,453 |
-| Records missing customer ID | 13,446 |
-| Records missing description | 228 |
-
-A positive sale is a non-cancelled record whose quantity and price are both greater than zero. Negative quantities are retained because they can represent returns or cancellations.
+A positive sale is a non-cancelled record whose quantity and price are both greater than zero.
 
 ### Gold layer
 
@@ -130,31 +143,107 @@ online_retail.silver.transactions_clean
 online_retail.gold.product_sales_summary
 ```
 
-The Gold table contains a monthly product-level sales summary. It filters to positive sales, groups records by `batch_id` and `stock_code`, and calculates:
+The Gold table has a monthly product grain of `batch_id + stock_code`. It contains:
 
-- Product description
+- Representative product description
 - Total quantity sold
 - Total revenue
 - Distinct invoice count
 - Distinct customer count
 
-**Gold summary records stored:** `3,057`
+The Gold process filters to positive sales, validates the composite `MERGE` key, reconciles Silver and Gold measures, and synchronizes only the selected batch. Batch-scoped deletion removes obsolete product summaries without affecting other months.
 
-## Pipeline validation
+## Processed batch results
 
-The final notebook independently aggregates positive-sale measures from Silver and compares them with Gold.
+| Batch | Bronze rows | Duplicates removed | Silver rows | Gold rows |
+|---|---:|---:|---:|---:|
+| `2009-12` | 45,228 | 506 | 44,722 | 3,057 |
+| `2010-01` | 31,555 | 321 | 31,234 | 2,687 |
+| `2010-02` | 29,388 | 330 | 29,058 | 2,577 |
+| **Total** | **106,171** | **1,157** | **105,014** | **8,321** |
+
+## Validation and reconciliation
+
+The independent validation notebook checks that:
+
+- Every requested batch exists in Bronze, Silver, and Gold.
+- The Bronze count minus duplicate business records equals the Silver count.
+- Silver contains no record IDs without a Bronze source record.
+- Positive-sale quantity and revenue totals match between Silver and Gold.
+
+Final `2010-02` reconciliation:
 
 | Measure | Silver | Gold | Result |
 |---|---:|---:|---|
-| Total quantity | 425,461 | 425,461 | Passed |
-| Total revenue | 822,483.95 | 822,483.95 | Passed |
+| Total quantity | 381,879 | 381,879 | Passed |
+| Total revenue | 551,504.72 | 551,504.72 | Passed |
 
-The dataset does not provide a confirmed currency in this implementation, so revenue is presented without a currency symbol.
+The dataset does not provide a confirmed currency in this implementation, so revenue is shown without a currency symbol.
+
+## Incremental processing and idempotency
+
+Every Databricks processing notebook accepts `batch_id` and `run_id` parameters. Stable matching keys and Delta `MERGE` operations allow the same monthly batch to be rerun safely.
+
+The `2010-02` batch was processed twice through the complete Lakeflow Job. The second run created a new audit history but left the stored counts unchanged:
+
+| Layer | Stored rows after first run | Stored rows after rerun |
+|---|---:|---:|
+| Bronze | 29,388 | 29,388 |
+| Silver | 29,058 | 29,058 |
+| Gold | 2,577 | 2,577 |
+
+## Orchestration and failure handling
+
+The Lakeflow Job executes:
+
+```text
+bronze_ingestion
+    -> silver_transformation
+    -> gold_analytics
+    -> pipeline_validation
+```
+
+The job-level `batch_id` and dynamic `run_id` parameters are pushed down to the notebook tasks. Downstream tasks run only after their dependencies succeed.
+
+A separate `failure_handler` task depends on all four processing tasks and runs when at least one fails. It records failed and upstream-failed states in the control table, then deliberately raises an exception so the overall pipeline remains visibly failed.
+
+![Successful Lakeflow pipeline run](docs/images/successful-pipeline-run.png)
+
+![Controlled pipeline failure](docs/images/failure-handling-run.png)
+
+## Auditing and monitoring
+
+Each processing task writes operational metadata to:
+
+```text
+online_retail.control.pipeline_runs
+```
+
+The control table stores:
+
+- Run ID and batch ID
+- Layer name and execution status
+- Start and end timestamps
+- Input and output row counts
+- Error classification
+
+The standalone monitoring notebook displays recent executions, unsuccessful tasks, and per-run summaries. It is intentionally excluded from the automated job.
+
+![Successful pipeline audit records](docs/images/successful-audit-records.png)
+
+![Failure audit records](docs/images/failure-audit-records.png)
 
 ## Repository structure
 
 ```text
 online-retail-lakehouse-pipeline/
+├── docs/
+│   └── images/
+│       ├── lakeflow-job-dag.png
+│       ├── successful-pipeline-run.png
+│       ├── failure-handling-run.png
+│       ├── successful-audit-records.png
+│       └── failure-audit-records.png
 ├── notebooks/
 │   ├── 01_prepare_monthly_batches.ipynb
 │   └── databricks/
@@ -162,57 +251,51 @@ online-retail-lakehouse-pipeline/
 │       ├── 01_bronze_ingestion.ipynb
 │       ├── 02_silver_transformation.ipynb
 │       ├── 03_gold_analytics.ipynb
-│       └── 04_pipeline_validation.ipynb
+│       ├── 04_pipeline_validation.ipynb
+│       ├── 05_failure_handler.ipynb
+│       └── 06_pipeline_monitoring.ipynb
 ├── .gitignore
 └── README.md
 ```
 
 | Notebook | Purpose |
 |---|---|
-| `01_prepare_monthly_batches.ipynb` | Prepare and validate monthly source batches using Pandas |
-| `00_environment_setup.ipynb` | Create the Unity Catalog catalog, schemas, and managed volume |
-| `01_bronze_ingestion.ipynb` | Ingest one monthly CSV into the Bronze Delta table |
-| `02_silver_transformation.ipynb` | Deduplicate, clean, flag, and store Silver records |
-| `03_gold_analytics.ipynb` | Produce the monthly product sales summary |
-| `04_pipeline_validation.ipynb` | Reconcile Silver and Gold measures using PySpark |
+| `01_prepare_monthly_batches.ipynb` | Prepare, export, and reconcile monthly CSV batches with Pandas |
+| `00_environment_setup.ipynb` | Create and verify the Unity Catalog catalog, schemas, volume, and control table |
+| `01_bronze_ingestion.ipynb` | Parameterized incremental ingestion into Bronze |
+| `02_silver_transformation.ipynb` | Profile, deduplicate, clean, flag, validate, and upsert Silver records |
+| `03_gold_analytics.ipynb` | Build and synchronize the monthly product-sales summary |
+| `04_pipeline_validation.ipynb` | Perform Bronze-to-Silver and Silver-to-Gold reconciliation |
+| `05_failure_handler.ipynb` | Record failed and upstream-failed task states |
+| `06_pipeline_monitoring.ipynb` | Inspect audit history and summarize pipeline runs |
 
 ## How to run
 
-1. Download the Online Retail II Excel workbook and place it at:
+1. Download the Online Retail II workbook from the dataset link above and place it at:
 
    ```text
    data/source/online_retail_II.xlsx
    ```
 
-2. Run `notebooks/01_prepare_monthly_batches.ipynb` locally. It creates the monthly CSV files under `data/monthly_batches/`.
-3. In Databricks, run `00_environment_setup.ipynb` to create the catalog, schemas, and volume.
-4. Upload `online_retail_2009-12.csv` to:
+2. Run `notebooks/01_prepare_monthly_batches.ipynb` locally. It writes the monthly CSV files to `data/monthly_batches/`.
+3. Import the Databricks notebooks and run `00_environment_setup.ipynb` once.
+4. Upload the desired monthly CSV file to:
 
    ```text
    /Volumes/online_retail/bronze/source_files/
    ```
 
-5. Run the Databricks notebooks in this order:
+5. Create a Lakeflow Job with the dependency order shown above and add these job parameters:
 
    ```text
-   01_bronze_ingestion
-   02_silver_transformation
-   03_gold_analytics
-   04_pipeline_validation
+   batch_id = YYYY-MM
+   run_id = {{job.run_id}}
    ```
 
-The original Excel workbook and generated CSV files are intentionally excluded from this repository.
+6. Configure the Failure Handler to run when at least one upstream task fails.
+7. Run the job for the selected monthly batch.
+8. Use `06_pipeline_monitoring.ipynb` to inspect execution history and failures.
 
-## Limitations and future improvements
+## Implementation summary
 
-This repository demonstrates a completed single-batch lakehouse pipeline. The following capabilities are not claimed as part of the current implementation:
-
-- Automated ingestion of all monthly files
-- Incremental processing and watermarking
-- Idempotent reruns using Delta `MERGE`
-- Control and audit tables
-- Record quarantine tables
-- Workflow orchestration and scheduling
-- Automated data-quality tests and alerting
-
-These would be the next steps for developing the project into a production-style pipeline.
+This project delivers a reusable incremental monthly lakehouse pipeline. Pandas prepared 25 monthly CSV batches, and three representative batches were processed through Databricks to validate initial loading, incremental Delta `MERGE`, orchestration, reconciliation, auditing, failure handling, and idempotent reruns.
