@@ -318,7 +318,7 @@ The job-level `batch_id` and dynamic `run_id` parameters are passed to the noteb
 
 A separate `failure_handler` task depends on the processing tasks and is triggered when an upstream task fails. It:
 
-1. Receives the task states and error codes.
+1. Receives the task states and error messages.
 2. Normalizes unsuccessful states.
 3. Records failed and upstream-failed task results in `online_retail_aws.control.pipeline_runs`.
 4. Displays the audit records for the failed run.
